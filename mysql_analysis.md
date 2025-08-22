@@ -872,3 +872,339 @@ bool needs_preservation =
 
 ### **🎉 Mission Accomplished**:
 This analysis provides **complete coverage** of MySQL's `position()` and `rnd_pos()` usage patterns, giving your federated engine implementation the exact information needed to handle these critical requirements correctly.
+
+---
+
+## 🔍 **DEEP DIVE: Exact `rnd_init → rnd_pos → rnd_next` Code Flow Analysis**
+
+### **Pattern 1: MEMORY-to-InnoDB Spill-to-Disk (Recursive CTEs)**
+
+#### **🎯 EXACT CODE FLOW SEQUENCE**
+
+##### **Step 1: Initial Setup** 
+**Location**: `sql/iterators/basic_row_iterators.cc:407-415`
+```cpp
+bool FollowTailIterator::Init() {
+  m_inited = true;
+  m_read_rows = 0;
+  m_end_of_current_iteration = 0;
+  m_recursive_iteration_count = 0;
+  
+  int error = table()->file->ha_rnd_init(false);  // 🔑 INITIAL rnd_init
+  if (error) {
+    return HandleError(error);
+  }
+  return false;
+}
+```
+**Purpose**: Initialize iterator for MEMORY table scanning
+
+##### **Step 2: Normal Scanning (MEMORY phase)**
+**Location**: `sql/iterators/basic_row_iterators.cc:474-489`
+```cpp
+int FollowTailIterator::Read() {
+  // ... validation logic ...
+  
+  // Read the actual row.
+  //
+  // We can never have MyISAM here, so we don't need the checks
+  // for HA_ERR_RECORD_DELETED that TableScanIterator has.
+  int err = table()->file->ha_rnd_next(m_record);  // 🔑 Normal rnd_next scanning
+  if (err) {
+    return HandleError(err);
+  }
+
+  ++m_read_rows;  // 🔑 Track logical position (crucial for repositioning)
+
+  if (m_examined_rows != nullptr) {
+    ++*m_examined_rows;
+  }
+  return 0;
+}
+```
+**Purpose**: Sequential scanning through MEMORY table, tracking logical position
+
+##### **Step 3: MEMORY Overflow Detection**
+**Location**: `sql/iterators/composite_iterators.cc:1940-1962`
+```cpp
+bool MaterializeIterator::MaterializeRecursive() {
+  // ... during row insertion to MEMORY table ...
+  
+  if (create_ondisk_from_heap(thd(), t, error,
+                              /*insert_last_record=*/true,
+                              /*ignore_last_dup=*/true, nullptr))
+    return true; /* purecov: inspected */
+    
+  if (m_spill_state.secondary_overflow() || single_row_too_large) {
+    // c), d)
+    assert(t->s->keys == 1);
+    if (t->file->ha_index_init(0, false) != 0) return true;
+  } else {
+    // else: a) we use hashing, so skip ha_index_init
+    assert(t->s->keys == 0);
+  }
+  ++*stored_rows;
+
+  // Inform each reader that the table has changed under their feet,
+  // so they'll need to reposition themselves.
+  for (const Operand &operand : m_operands) {
+    if (operand.is_recursive_reference) {
+      operand.recursive_reader->RepositionCursorAfterSpillToDisk();  // 🔑 TRIGGER REPOSITIONING
+    }
+  }
+}
+```
+**Purpose**: When MEMORY table overflows, convert to InnoDB and reposition active readers
+
+##### **Step 4: The Critical Repositioning Sequence**
+**Location**: `sql/iterators/basic_row_iterators.cc:491-499`
+```cpp
+bool FollowTailIterator::RepositionCursorAfterSpillToDisk() {
+  if (!m_inited) {
+    // Spill-to-disk happened before we got to read a single row,
+    // so the table has not been initialized yet. It will start
+    // at the first row when we actually get to Init(), which is fine.
+    return false;
+  }
+  return reposition_innodb_cursor(table(), m_read_rows);  // 🔑 REPOSITION CALL
+}
+```
+
+**Location**: `sql/sql_tmp_table.cc:2940-2952`
+```cpp
+bool reposition_innodb_cursor(TABLE *table, ha_rows row_num) {
+  assert(table->s->db_type() == innodb_hton);
+  if (table->file->ha_rnd_init(false)) return true; /* purecov: inspected */  // 🔑 STEP 1: rnd_init
+  // Per the explanation above, the wanted InnoDB row has PK=row_num.
+  uchar rowid_bytes[6];
+  encode_innodb_position(rowid_bytes, sizeof(rowid_bytes), row_num);
+  /*
+    Go to the row, and discard the row. That places the cursor at
+    the same row as before the engine conversion, so that rnd_next() will
+    read the (row_num+1)th row.
+  */
+  return table->file->ha_rnd_pos(table->record[0], rowid_bytes);  // 🔑 STEP 2: rnd_pos
+}
+```
+**Purpose**: 
+1. `ha_rnd_init(false)` - Initialize for random access on InnoDB table
+2. `ha_rnd_pos(rowid_bytes)` - Position cursor to logical row N (where scanning stopped)
+
+##### **Step 5: Continued Scanning After Repositioning**
+**Location**: `sql/iterators/basic_row_iterators.cc:474-489` (SAME Read() method, but now on InnoDB!)
+```cpp
+int FollowTailIterator::Read() {
+  // ... same validation logic as before ...
+  
+  // Read the actual row.
+  //
+  // We can never have MyISAM here, so we don't need the checks
+  // for HA_ERR_RECORD_DELETED that TableScanIterator has.
+  int err = table()->file->ha_rnd_next(m_record);  // 🔑 STEP 3: rnd_next (continues from positioned location!)
+  if (err) {
+    return HandleError(err);
+  }
+
+  ++m_read_rows;  // Now tracking InnoDB logical position
+
+  if (m_examined_rows != nullptr) {
+    ++*m_examined_rows;
+  }
+  return 0;
+}
+```
+**Purpose**: Continue sequential scanning from repositioned location using `ha_rnd_next()`
+
+#### **🎯 COMPLETE SEQUENCE SUMMARY**:
+```
+1. MEMORY Phase:
+   ha_rnd_init(false) → ha_rnd_next() → ha_rnd_next() → ... (read 1000 rows)
+   
+2. Overflow Event:
+   create_ondisk_from_heap() → copy all 1000 rows to InnoDB table
+   
+3. Repositioning:
+   ha_rnd_init(false) → ha_rnd_pos(position_of_row_1000)
+   
+4. Continuation:
+   ha_rnd_next() → reads row 1001 (continues seamlessly!)
+   ha_rnd_next() → reads row 1002
+   ha_rnd_next() → reads row 1003
+   ... and so on
+```
+
+---
+
+### **Pattern 2: Window Function Frame Navigation**
+
+#### **🎯 EXACT CODE FLOW SEQUENCE**
+
+##### **Step 1: Frame Buffer Initialization**
+**Location**: `sql/iterators/window_iterators.cc:140-146`
+```cpp
+bool buffer_windowing_record(TABLE *table, Temp_table_param *param,
+                             THD *thd, Window *w, framebuffer_entry_t *fb_info) {
+  // ... setup logic ...
+  
+  /*
+    We use a single scan for writing and later for reading
+    the temporary file. To prepare for reads, we initialize a scan once
+    for all with ha_rnd_init(), with argument=true as we'll use ha_rnd_next().
+  */
+  int rc = t->file->ha_rnd_init(true);  // 🔑 Initialize for sequential reading
+  if (rc != 0) {
+    t->file->print_error(rc, MYF(0));
+    return true;
+  }
+  
+  // ... rest of function ...
+}
+```
+**Purpose**: Initialize frame buffer for sequential scanning during window function processing
+
+##### **Step 2: Cache Strategic Positions**
+**Location**: `sql/iterators/window_iterators.cc:225-228`
+```cpp
+// Save position in frame buffer file of first row in a partition
+if (save_pos) {
+  t->file->position(record);  // 🔑 Store position for later navigation
+  std::memcpy(w->m_frame_buffer_positions[first_in_partition].m_position,
+              t->file->ref, t->file->ref_length);
+  w->m_frame_buffer_positions[first_in_partition].m_rowno = 1;
+}
+```
+**Purpose**: Cache row positions at strategic boundaries (partition boundaries, frame edges)
+
+##### **Step 3: Window Function Navigation Request**
+**Location**: `sql/iterators/window_iterators.cc:285-308`
+```cpp
+bool read_frame_buffer_row(int64 rowno, Window *w,
+#ifndef NDEBUG
+                           bool for_nth_value)
+#else
+                           bool for_nth_value [[maybe_unused]])
+#endif
+{
+  int use_idx = 0;  // closest prior position found, a priori 0 (row 1)
+  int diff = w->last_rowno_in_cache();  // maximum a priori
+  TABLE *fb = w->frame_buffer();
+
+  // Find the saved position closest to where we want to go
+  for (int i = w->m_frame_buffer_positions.size() - 1; i >= 0; i--) {
+    Window::Frame_buffer_position cand = w->m_frame_buffer_positions[i];
+    if (cand.m_rowno == -1 || cand.m_rowno > rowno) continue;
+
+    if (rowno - cand.m_rowno < diff) {
+      /* closest so far */
+      diff = rowno - cand.m_rowno;
+      use_idx = i;
+    }
+  }
+
+  Window::Frame_buffer_position *cand = &w->m_frame_buffer_positions[use_idx];
+```
+**Purpose**: Find best cached position to minimize forward scanning distance
+
+##### **Step 4: Position and Continue Scanning**
+**Location**: `sql/iterators/window_iterators.cc:310-347`
+```cpp
+  int error = fb->file->ha_rnd_pos(fb->record[0], cand->m_position);  // 🔑 STEP 1: rnd_pos to cached location
+  if (error) {
+    fb->file->print_error(error, MYF(0));
+    return true;
+  }
+
+  if (rowno > cand->m_rowno) {
+    /*
+      The saved position didn't correspond exactly to where we want to go, but
+      is located one or more rows further out on the file, so read next to move
+      forward to desired row.
+    */
+    const int64 cnt = rowno - cand->m_rowno;
+
+    /*
+      We should have enough location hints to normally need only one extra read.
+      If we have just switched to INNODB due to MEM overflow, a rescan is
+      required, so skip assert if we have INNODB.
+    */
+    assert(fb->s->db_type()->db_type == DB_TYPE_INNODB || cnt <= 1 ||
+           // unless we have a frame beyond the current row, 1. time
+           // in which case we need to do some scanning...
+           (w->last_row_output() == 0 &&
+            w->frame()->m_from->m_border_type == WBT_VALUE_FOLLOWING) ||
+           // or unless we are search for NTH_VALUE, which can be in the
+           // middle of a frame, and with RANGE frames it can jump many
+           // positions from one frame to the next with optimized eval
+           // strategy
+           for_nth_value);
+
+    for (int i = 0; i < cnt; i++) {
+      error = fb->file->ha_rnd_next(fb->record[0]);  // 🔑 STEP 2: rnd_next to scan forward
+      if (error) {
+        fb->file->print_error(error, MYF(0));
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+```
+
+#### **🎯 WINDOW FUNCTION SEQUENCE SUMMARY**:
+```
+1. Initialization:
+   ha_rnd_init(true) for frame buffer
+   
+2. Position Caching:
+   During writing: position() calls at strategic boundaries
+   Cache positions: row_1=pos_A, row_500=pos_B, row_800=pos_C
+   
+3. Navigation Request (e.g., need row 1000):
+   Find best start: pos_C (row 800) is closest to target 1000
+   
+4. Position and Scan:
+   ha_rnd_pos(pos_C) → positions at row 800
+   ha_rnd_next() → row 801
+   ha_rnd_next() → row 802
+   ... (198 iterations)
+   ha_rnd_next() → row 1000 (target reached!)
+```
+
+---
+
+## 🔑 **CRITICAL FINDINGS FOR FEDERATED ENGINES**
+
+### **Confirmed Patterns Requiring `rnd_init → rnd_pos → rnd_next` Support**:
+
+1. **Recursive CTE Spill-to-Disk**: 
+   - **Files**: `sql/iterators/basic_row_iterators.cc`, `sql/sql_tmp_table.cc`
+   - **Pattern**: `rnd_init → rnd_pos(logical_row_N) → rnd_next → rnd_next...`
+   - **Frequency**: Every recursive CTE that exceeds `tmp_table_size`
+
+2. **Window Function Frame Navigation**:
+   - **Files**: `sql/iterators/window_iterators.cc`
+   - **Pattern**: `rnd_pos(cached_position) → rnd_next × N → target_row`
+   - **Frequency**: Every window function with ROWS/RANGE frames
+
+### **Implementation Requirements for Federated Engines**:
+
+#### **Must Support**:
+1. **Result Set Preservation**: Cannot discard result sets once `position()` called
+2. **Logical Positioning**: Support positioning to logical row numbers, not just physical positions
+3. **Scan Continuation**: Must support `rnd_next()` calls after `rnd_pos()` positioning
+4. **Mixed Access Patterns**: Handle both sequential scanning and random positioning on same result set
+
+#### **Key Technical Challenges**:
+1. **Remote Server Cursors**: Need server-side cursors that survive positioning operations
+2. **Position Encoding**: Must encode logical positions that work across engine conversions
+3. **State Management**: Track multiple active scans with different positioning requirements
+4. **Performance Optimization**: Minimize round trips while supporting positioning requirements
+
+### **Optimization Strategies**:
+1. **Pattern Detection**: Identify CTE and window function patterns early
+2. **Cursor Management**: Use named cursors or bookmarks for efficient repositioning  
+3. **Batch Prefetching**: Fetch multiple rows after positioning to reduce round trips
+4. **Position Caching**: Cache strategic positions like window functions do
+
+This deep-dive analysis provides the EXACT code paths where federated engines must implement the challenging `rnd_init → rnd_pos → rnd_next` continuation pattern.
