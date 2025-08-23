@@ -945,6 +945,79 @@ Update phase:
 table->file->ha_rnd_pos(table->record[0], rowid);
 ```
 
+#### **🎯 Core Concept: "Fetch After the Fact"**
+Range optimization uses `rnd_pos()` for retrieving full rows **after** index operations have identified specific row IDs. This is a **"locate-and-fetch"** pattern, not scan continuation.
+
+#### **📋 Specific Use Cases:**
+
+##### **1. Index Intersection**
+```sql
+SELECT * FROM users WHERE age = 25 AND city = 'NYC' AND status = 'active';
+```
+
+**When You Have:**
+- Index on `age`
+- Index on `city` 
+- Index on `status`
+
+**MySQL's Process:**
+```
+1. Index scan on age=25     → finds row IDs: [10, 15, 25, 30, 40]
+2. Index scan on city='NYC' → finds row IDs: [10, 20, 25, 35, 45]  
+3. Index scan on status     → finds row IDs: [5, 10, 25, 30, 50]
+4. Intersection result      → row IDs: [10, 25]  (common to all)
+5. rnd_pos(row_id_10) → fetch full row 10
+6. rnd_pos(row_id_25) → fetch full row 25
+```
+
+##### **2. Index Union**
+```sql
+SELECT * FROM products WHERE category = 'electronics' OR price < 100;
+```
+
+**MySQL's Process:**
+```
+1. Index scan category='electronics' → row IDs: [5, 15, 25]
+2. Index scan price < 100           → row IDs: [10, 20, 30]
+3. Union result                     → row IDs: [5, 10, 15, 20, 25, 30]
+4. rnd_pos(row_id_5) → fetch row 5
+5. rnd_pos(row_id_10) → fetch row 10
+... and so on
+```
+
+##### **3. Index Merge**
+```sql  
+SELECT * FROM orders WHERE customer_id = 123 OR order_date = '2023-01-01';
+```
+
+**Process:**
+- Multiple index scans find different sets of row IDs
+- Merge/combine the row ID sets  
+- Use `rnd_pos()` to fetch each identified row
+
+#### **🔍 Key Characteristics:**
+
+1. **Independent Row Fetches**: Each `rnd_pos()` call fetches one specific row
+2. **No Scan Continuation**: No `rnd_next()` calls after `rnd_pos()`
+3. **Index-First**: Row IDs come from index operations, not table scans
+4. **Covering Index Optimization**: If indexes contain all needed columns, no `rnd_pos()` needed
+
+#### **💡 For Federated Engine Implementation:**
+
+**Pattern Recognition:**
+- Multiple different row IDs requested via `rnd_pos()`  
+- No scanning - just direct positioning
+- Can optimize with batch fetching of multiple specific rows
+
+**Optimization Opportunities:**
+```cpp
+// Instead of individual calls:
+rnd_pos(row_id_10); rnd_pos(row_id_25); rnd_pos(row_id_30);
+
+// Batch fetch:
+batch_rnd_pos([row_id_10, row_id_25, row_id_30]);
+```
+
 **Notes from Code**:
 - "index merge uses position() instead of ha_rnd_pos()"
 - "fetch after the fact" pattern
