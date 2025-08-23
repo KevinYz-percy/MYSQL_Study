@@ -66,6 +66,50 @@ int make_sortkey(const Filesort *filesort, Temp_table_param *param,
 **Called**: Once per row during the sorting phase
 **Context**: Part of the `filesort()` main loop that processes and sorts all rows
 
+###### **🔬 DETAILED POSITION STORAGE MECHANISM**
+
+The position storage happens in two critical steps:
+
+**Step 1: Position Capture** (`filesort.cc:986`)
+```cpp
+table->file->position(table->record[0]);  // Stores position in table->file->ref
+```
+This call captures the current row's position and stores it in the handler's internal `ref` buffer.
+
+**Step 2: Position Storage in Sort Key** (`filesort.cc:1555-1557` in `Sort_param::make_sortkey()`)
+```cpp
+// Row ID Mode storage (when NOT using addon fields)
+memcpy(to, table->file->ref, table->file->ref_length);  // Position stored at end of sort key
+to += table->file->ref_length;
+```
+
+**Memory Layout of Sort Key in Row ID Mode:**
+```
+[Sort Key Fields][NULL flags][Position Data (ref_length bytes)]
+|               |            |                                 |
+|<-- Variable -->|<- 1 byte ->|<------ table->file->ref_length -->|
+```
+
+**Two Storage Modes:**
+
+1. **Addon Fields Mode** (`using_addon_fields() == true`):
+   - Complete field values stored after sort key
+   - **No position stored** - not needed since we have complete row data
+   - Used for: Small records, no BLOBs, SELECT queries
+
+2. **Row ID Mode** (`using_addon_fields() == false`):
+   - **Position stored as last component** of sort key buffer
+   - Used for: Large records, BLOBs, UPDATE/DELETE operations
+   - **Critical for `rnd_pos()` retrieval** during sorted access
+
+**Flow Summary:**
+```
+1. table->file->position(record[0])     // Capture position → table->file->ref
+2. make_sortkey() → memcpy(to, ref)     // Store position in sort buffer
+3. sort_buffer()                        // Sort keys with embedded positions  
+4. rnd_pos(cached_position)             // Retrieve using stored position
+```
+
 ##### **Phase 2: Sort Buffer Processing**  
 **Location**: `sql/filesort.cc:1595-1598` (within `filesort()` function)
 ```cpp
@@ -166,6 +210,58 @@ int SortBufferIndirectIterator::Read() {
     return 0;  // 🔑 RETURN ONE ROW (in sorted order)
   }
 }
+```
+
+###### **🔬 DETAILED POSITION RETRIEVAL MECHANISM**
+
+**Where does `cache_pos` (the stored position) come from?**
+
+**Step 1: Buffer Initialization** (`sorting_iterator.cc:165`)
+```cpp
+m_cache_pos = m_sort_result->sorted_result.get();  // Points to sorted buffer
+```
+**Purpose**: Points to the **sorted buffer containing all the sort keys + positions**
+
+**Step 2: Per-Row Position Extraction** (`sorting_iterator.cc:176-177`)
+```cpp
+uchar *cache_pos = m_cache_pos;           // Current position in sorted buffer
+m_cache_pos += m_sum_ref_length;          // Advance to next row's position
+```
+**Purpose**: `cache_pos` now points to **the exact position data** for this sorted row
+
+**Step 3: Position Usage** (`sorting_iterator.cc:192`)
+```cpp
+int tmp = table->file->ha_rnd_pos(table->record[0], cache_pos);  // Uses extracted position
+```
+
+**Complete Data Flow:**
+```
+STORAGE PHASE:                    RETRIEVAL PHASE:
+┌─────────────────────┐          ┌──────────────────────────┐
+│1. position(record)  │         │4. cache_pos points to    │
+│   → table->file->ref│    ───► │   stored position data   │
+└─────────────────────┘          └──────────────────────────┘
+           │                                 │
+           ▼                                 ▼
+┌─────────────────────┐          ┌──────────────────────────┐
+│2. memcpy(to, ref)   │         │5. ha_rnd_pos(record,     │
+│   → sort buffer     │    ───► │       cache_pos)         │
+└─────────────────────┘          └──────────────────────────┘
+           │
+           ▼
+┌─────────────────────┐
+│3. sort_buffer()     │
+│   → sorted positions│
+└─────────────────────┘
+```
+
+**Memory Layout During Retrieval:**
+```
+Sorted Buffer: [Row1_SortKey][Row1_Position][Row2_SortKey][Row2_Position]...
+                              ▲
+                         cache_pos (points here)
+                         
+ha_rnd_pos() uses this exact position data to retrieve the row!
 ```
 
 #### **🎯 Key Insight**: 
