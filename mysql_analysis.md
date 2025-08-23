@@ -35,6 +35,97 @@ table->file->position(table->record[0]);
 - **`position()` called**: Line 986 - `table->file->position(table->record[0])`
 - **Iterator**: `SortBufferIndirectIterator` - **USES `rnd_pos()` TO FETCH ROWS**
 
+###### **🔑 WHY DELETE/UPDATE OPERATIONS FORCE ROW IDs**
+
+**Critical Code Evidence:**
+- **DELETE**: `sql/sql_delete.cc:538` - `/*force_sort_rowids=*/true`
+- **UPDATE**: `sql/sql_update.cc:673` - `/*force_sort_rowids=*/true`
+- **Decision Logic**: `sql/filesort.cc:198-199` - `if (force_sort_rowids) { keep_rowid; }`
+
+**Technical Reasons:**
+
+1. **Row Modification Requires Physical Location**
+   ```cpp
+   // DELETE/UPDATE need EXACT physical row location
+   table->file->ha_rnd_pos(table->record[0], cache_pos);  // Find exact row
+   table->file->ha_delete_row(table->record[0]);          // DELETE case  
+   table->file->ha_update_row(old_data, new_data);        // UPDATE case
+   ```
+
+2. **Addon Fields Are Read-Only Copies**
+   ```cpp
+   // Addon fields = field VALUE copies in memory
+   // Useless for DELETE/UPDATE - no way to locate original physical row!
+   ```
+
+3. **Transactional Integrity**
+   - **Problem**: Field values may change between sort and execution time
+   - **Solution**: Row IDs provide stable references to physical rows
+   - **Example**: Sort by `salary DESC`, then UPDATE `salary` - need row position, not old salary value
+
+4. **Multi-Table Operations**
+   ```cpp
+   // Multi-table DELETE/UPDATE must identify EXACT rows across tables
+   DELETE t1, t2 FROM table1 t1 JOIN table2 t2 WHERE ... ORDER BY ...
+   // Each table needs its physical row position stored for deletion
+   ```
+
+**🔍 SPECIFIC SQL QUERY TYPES REQUIRING SORT + ROW IDs:**
+
+1. **DELETE with ORDER BY + LIMIT**
+   ```sql
+   DELETE FROM employees WHERE salary < 50000 ORDER BY hire_date LIMIT 10;
+   -- Must sort by hire_date, then delete specific 10 rows
+   -- Requires: position() → sort → rnd_pos() for each row to delete
+   ```
+
+2. **UPDATE with ORDER BY + LIMIT**
+   ```sql
+   UPDATE products SET price = price * 0.9 WHERE category = 'old' ORDER BY stock_level LIMIT 5;
+   -- Must sort by stock_level, then update specific 5 rows  
+   -- Requires: position() → sort → rnd_pos() for each row to update
+   ```
+
+3. **Multi-Table DELETE**
+   ```sql
+   DELETE t1, t2 FROM table1 t1 JOIN table2 t2 WHERE t1.id = t2.id AND t1.status = 'inactive';
+   -- Must identify exact physical rows in BOTH tables
+   -- Requires: position() for each table → rnd_pos() to delete from each
+   ```
+
+4. **Multi-Table UPDATE** ⚠️ **DIFFERENT PATTERN - NOT CONTINUATION**
+   ```sql
+   UPDATE customers c JOIN orders o SET c.total_spent = c.total_spent + o.amount 
+   WHERE o.status = 'completed';
+   -- Two-phase process: COLLECT row IDs → POSITION and modify each row
+   -- Pattern: position() → store in temp table → rnd_pos() → UPDATE (no rnd_next)
+   ```
+
+**🔍 CRITICAL CLARIFICATION: Multi-table UPDATE Process**
+
+**Phase 1: Row ID Collection** (`sql/sql_update.cc:2135`)
+```cpp
+// For each qualifying row during JOIN scanning:
+table->file->position(table->record[0]);  // Get row position
+StoreRowId(table, tmp_table, field_num);  // Store in temporary table
+```
+
+**Phase 2: Positioned Updates** (`sql/sql_update.cc:2164`)
+```cpp
+// For each stored row ID:
+table->file->ha_rnd_pos(table->record[0], stored_rowid);  // Position on exact row
+// Perform UPDATE operation
+// NO rnd_next() calls - just position and modify
+```
+
+**Key Insight**: Multi-table UPDATE is **"locate-and-modify"**, NOT **"position-and-continue-scanning"**
+
+**Why These Queries Need Row IDs:**
+- **ORDER BY** + **DML operations** = Must sort first, then modify exact rows
+- **LIMIT** with **DML** = Must identify precise subset of rows 
+- **Multi-table DML** = Must track exact physical locations across multiple tables
+- **Complex WHERE** + **ORDER BY** = Cannot use index order, must sort result set
+
 #### **🔍 DETAILED CODE ANALYSIS: Critical Path for Federated Engines**
 
 ##### **Phase 1: Position Storage During Sort**
