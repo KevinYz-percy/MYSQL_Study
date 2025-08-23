@@ -3,10 +3,14 @@
 ## Overview
 This document analyzes how MySQL uses `position()` and `rnd_pos()` methods, specifically focusing on scenarios where range scanning continues after positioning. This is critical for implementing federated-like storage engines that need to understand when complete result set preservation is required.
 
-## Key Finding
-MySQL **DOES** resume sequential scans after `rnd_pos()` calls. Storage engines must support the pattern:
+## 🚨 REVISED KEY FINDING - MAJOR DISCOVERY
+MySQL continuation patterns **DO NOT APPLY** to federated tables directly! 
+Both major continuation patterns (Window Functions and Recursive CTEs) operate on **temporary tables** (MEMORY/InnoDB), not the original federated storage engine.
+
+**Federated engines need:**
 ```
-rnd_init → rnd_pos(saved_position) → rnd_next → rnd_next → ...
+✅ Basic rnd_pos() for exact positioning (filesort, multi-table operations)
+❌ NO rnd_pos() → rnd_next() continuation patterns required
 ```
 
 ## Code Locations for Deep Analysis
@@ -1227,7 +1231,7 @@ From `sql/range_optimizer/rowid_ordered_retrieval.h:109-112`:
 ## **📋 SUMMARY: Iterator Repositioning Patterns Analysis**
 
 ### **🔑 Key Discovery**: 
-Iterator repositioning includes both **MEMORY-to-InnoDB conversion** (already analyzed) and **Window Function Frame Navigation** which DOES use `rnd_pos() → rnd_next()` continuation!
+Iterator repositioning includes both **MEMORY-to-InnoDB conversion** (already analyzed) and **Window Function Frame Navigation** ⚠️ **BUT Window Functions use TEMPORARY TABLES, not federated engines!**
 
 #### **⚠️ Critical Scenarios Identified**:
 
@@ -1429,11 +1433,11 @@ From `sql/iterators/window_iterators.cc:127-128`:
 
 ### **📊 Analysis Results Summary**:
 - **Total Use Cases**: 5
-- **Scan Continuation Required**: 3 (60%)
+- **Scan Continuation Required on Federated Tables**: 0 (0%)
 - **Independent Positioning Only**: 2 (40%)
 
-### **🔑 Answer to Original Question**:
-**YES**, MySQL **DOES** require storage engines to support continued sequential scanning after `rnd_pos()` calls. The federated engine TODO comment about "discarding result sets" is a **critical concern** - result sets MUST be preserved for these patterns.
+### **🔑 REVISED Answer to Original Question**:
+**NO**, MySQL does **NOT** require federated engines to support continued sequential scanning after `rnd_pos()` calls. Both major continuation patterns (Window Functions and Recursive CTEs) use temporary tables, not federated tables. The federated engine TODO comment about "discarding result sets" is **partially safe** - only basic positioning is required.
 
 ### **💡 Implementation Strategy for Federated Engines**:
 
@@ -1926,25 +1930,140 @@ if (const int error = table->file->ha_rnd_pos(
 **Pattern**: Independent `rnd_pos()` calls (NO continuation)
 **Frequency**: Once per row being updated
 
-##### **3. Window Function Frame Navigation**
-**Location**: `sql/iterators/window_iterators.cc:310`
-```cpp
-// In read_frame_buffer_row() function
-int error = fb->file->ha_rnd_pos(fb->record[0], cand->m_position);  // 🔑 POSITIONING CALL
-```
-**Purpose**: Position to cached frame boundary, then scan forward with `rnd_next()`
-**Pattern**: `rnd_pos()` + multiple `rnd_next()` calls (**TRUE CONTINUATION**)
-**Frequency**: During window function frame calculations
+##### **3. Window Function Frame Navigation** ⚠️ **CRITICAL DISCOVERY - NOT FEDERATED ENGINE**
+**Location**: `sql/iterators/window_iterators.cc:310-346` (`read_frame_buffer_row()`)
 
-##### **4. Recursive CTE Spill-to-Disk Repositioning**
-**Location**: `sql/sql_tmp_table.cc:2951`
+#### **🔍 CRITICAL FINDING: Frame Buffer Engine Analysis**
+
+**Frame Buffer (`fb`) is NOT the federated engine** - it's a temporary table!
+
+**Frame Buffer Creation** (`sql/sql_select.cc:4395-4401`)
 ```cpp
-// In reposition_innodb_cursor() function
-return table->file->ha_rnd_pos(table->record[0], rowid_bytes);  // 🔑 REPOSITIONING CALL
+TABLE *table = create_tmp_table(thd, par, fb_fields, nullptr, false, false,
+                                query_block.active_options(), HA_POS_ERROR,
+                                "window frame buffer");  // Creates MEMORY table initially
+window->set_frame_buffer(table);
 ```
-**Purpose**: Reposition after MEMORY→InnoDB conversion, continue with `rnd_next()`
-**Pattern**: `rnd_pos()` + continued `rnd_next()` calls (**TRUE CONTINUATION**)
-**Frequency**: During CTE table spill events
+
+**Engine Types for Frame Buffer:**
+- **Initially**: **MEMORY engine** (fast in-memory temporary table)
+- **On overflow**: **InnoDB engine** (via `create_ondisk_from_heap()`)
+
+**Engine Conversion** (`sql/iterators/window_iterators.cc:160-164`)
+```cpp
+if (create_ondisk_from_heap(thd, t, error, /*insert_last_record=*/true,
+                            /*ignore_last_dup=*/true, &is_duplicate))
+  return true;
+
+assert(t->s->db_type() == innodb_hton);  // Now it's InnoDB!
+```
+
+#### **🎯 The Actual Continuation Pattern:**
+```cpp
+// PHASE 1: Position to closest cached frame boundary
+int error = fb->file->ha_rnd_pos(fb->record[0], cand->m_position);  // 🔑 POSITIONING CALL
+                                                                     // ↑ On MEMORY/InnoDB, NOT federated!
+
+// PHASE 2: Check if exact position or need to scan forward
+if (rowno > cand->m_rowno) {
+  const int64 cnt = rowno - cand->m_rowno;
+  
+  // PHASE 3: Continue scanning forward to target row
+  for (int i = 0; i < cnt; i++) {
+    error = fb->file->ha_rnd_next(fb->record[0]);  // 🔑 TRUE CONTINUATION
+                                                   // ↑ On MEMORY/InnoDB, NOT federated!
+  }
+}
+```
+
+#### **📋 Complete Window Function Data Flow:**
+```
+1. Original federated table data → Read via standard table scan
+     ↓
+2. Copy all rows to frame buffer (MEMORY engine initially)
+     ↓  
+3. Window function calculations use frame buffer ONLY
+   - position() calls on MEMORY/InnoDB frame buffer
+   - rnd_pos() + rnd_next() on MEMORY/InnoDB frame buffer
+   - FEDERATED ENGINE NOT INVOLVED in continuation pattern
+     ↓
+4. Results returned (original federated table not accessed during frame navigation)
+```
+
+#### **🚨 MAJOR IMPLICATION FOR FEDERATED ENGINE:**
+
+**GOOD NEWS**: Federated engines **DO NOT** need to implement window function continuation patterns!
+
+**What Federated Engine Actually Needs:**
+- ✅ **Initial data reading** for frame buffer population (standard table scan)
+- ✅ **Basic `position()` and `rnd_pos()`** for other use cases  
+- ❌ **NO window function continuation complexity** - handled by MEMORY/InnoDB
+
+**Pattern**: `federated_scan → frame_buffer_copy → window_calculations_on_temp_table`
+**Frequency**: Window function continuation happens on temporary tables, not federated tables
+
+##### **4. Recursive CTE Spill-to-Disk Repositioning** ⚠️ **CRITICAL DISCOVERY - NOT FEDERATED ENGINE**
+**Location**: `sql/sql_tmp_table.cc:2940-2951` (`reposition_innodb_cursor()`)
+
+#### **🔍 CRITICAL FINDING: CTE Repositioning Engine Analysis**
+
+**CTE Repositioning happens on TEMPORARY TABLES, NOT federated tables!**
+
+**Critical Code Evidence** (`sql/sql_tmp_table.cc:2941`)
+```cpp
+bool reposition_innodb_cursor(TABLE *table, ha_rows row_num) {
+  assert(table->s->db_type() == innodb_hton);  // 🔑 ONLY WORKS ON INNODB!
+  if (table->file->ha_rnd_init(false)) return true;
+  
+  uchar rowid_bytes[6];
+  encode_innodb_position(rowid_bytes, sizeof(rowid_bytes), row_num);
+  
+  /*
+    Go to the row, and discard the row. That places the cursor at
+    the same row as before the engine conversion, so that rnd_next() will
+    read the (row_num+1)th row.
+  */
+  return table->file->ha_rnd_pos(table->record[0], rowid_bytes);  // 🔑 INNODB REPOSITIONING
+                                                                  // ↑ On temp table, NOT federated!
+}
+```
+
+#### **📋 Complete CTE Data Flow for Federated Tables:**
+```
+1. Data Collection from Federated Table
+   ┌─────────────────────────────────┐
+   │ Federated Table Scans           │ ← Standard ha_rnd_next() calls
+   │ (Multiple iterations)           │ ← NO position() or rnd_pos() needed
+   │ Copy results to temp table      │
+   └─────────────────────────────────┘
+                │
+                ▼
+2. CTE Processing on Temporary Table
+   ┌─────────────────────────────────┐
+   │ MEMORY temp table               │
+   │ FollowTailIterator reads here   │ ← CTE logic happens here
+   └─────────────────────────────────┘
+                │ (On memory overflow)
+                ▼
+3. Temp Table Engine Conversion (NO FEDERATED IMPACT)
+   ┌─────────────────────────────────┐
+   │ MEMORY → InnoDB conversion      │ ← reposition_innodb_cursor() here
+   │ rnd_pos() + rnd_next() calls    │ ← On InnoDB temp table
+   │ FEDERATED ENGINE NOT INVOLVED   │ ← Original table not accessed
+   └─────────────────────────────────┘
+```
+
+#### **🚨 MAJOR IMPLICATION FOR FEDERATED ENGINE:**
+
+**EXCELLENT NEWS**: Federated engines **DO NOT** need to implement CTE continuation patterns!
+
+**What Federated Engine Actually Needs for CTEs:**
+- ✅ **Standard table scans** for data collection (multiple `ha_rnd_next()` iterations)
+- ✅ **Efficient connection management** for recursive query phases
+- ❌ **NO complex repositioning** - handled by temporary table system
+
+**Pattern**: `federated_scan → temp_table_copy → CTE_processing_on_temp_table`
+**Frequency**: CTE continuation happens on temporary tables, not federated tables
 
 ##### **5. Range Optimization Index Intersection**
 **Location**: `sql/range_optimizer/rowid_ordered_retrieval.cc:406`
@@ -2055,8 +2174,9 @@ Duplicate detection → direct rnd_pos() → no position() involved
 - **Range Optimization** (direct row fetching only)
 - **INSERT Duplicate Handling** (conflict resolution only)
 
-### **Critical Insight**: 
-Only **2 out of 8 major patterns** require true `rnd_pos() → rnd_next()` continuation support.
+### **🚨 CRITICAL INSIGHT - MAJOR DISCOVERY**: 
+**0 out of 8 major patterns** require true `rnd_pos() → rnd_next()` continuation support on federated engines!
+*Both Window Functions AND Recursive CTEs use temporary tables (MEMORY/InnoDB), not the original federated table.*
 
 ---
 
@@ -2077,7 +2197,7 @@ Only **2 out of 8 major patterns** require true `rnd_pos() → rnd_next()` conti
 #### **Storage Engine `rnd_pos()` Calls** (9 patterns):
 1. **Filesort Retrieval** (`sql/iterators/sorting_iterator.cc:380`) - Sequential sorted access
 2. **Multi-table UPDATE Positioning** (`sql/sql_update.cc:2164`) - Exact row positioning
-3. **Window Function Navigation** (`sql/iterators/window_iterators.cc:310`) - Position + continuation
+3. **Window Function Navigation** (`sql/iterators/window_iterators.cc:310`) - ⚠️ **TEMPORARY TABLE ONLY - NOT FEDERATED**
 4. **Recursive CTE Repositioning** (`sql/sql_tmp_table.cc:2951`) - Position + continuation
 5. **Index Intersection** (`sql/range_optimizer/rowid_ordered_retrieval.cc:406`) - Direct row fetch
 6. **Index Union** (`sql/range_optimizer/rowid_ordered_retrieval.cc:468`) - Direct row fetch
@@ -2152,11 +2272,11 @@ Only **2 out of 8 major patterns** require true `rnd_pos() → rnd_next()` conti
 3. **Filesort Compatibility** - Support sequential `rnd_pos()` in sorted order
 
 #### **Phase 2: Advanced Features** (Required for full MySQL compatibility)  
-4. **Window Function Support** - `rnd_pos() + rnd_next()` continuation
+4. **Window Function Support** - ⚠️ **NOT REQUIRED - Uses temporary tables**
 5. **Multi-table Operations** - Complex UPDATE/DELETE positioning
 
 #### **Phase 3: Complete Compliance** (Required for edge cases)
-6. **Recursive CTE Support** - Engine conversion with repositioning
+6. **Recursive CTE Support** - ⚠️ **NOT REQUIRED - Uses temporary tables**
 7. **Range Optimization** - Index intersection/union support
 
 ---
@@ -2182,30 +2302,25 @@ int ha_federated::position(const uchar *record) {
 ```cpp
 int ha_federated::rnd_pos(uchar *buf, uchar *pos) {
   // CRITICAL: Position exactly on stored position
-  // MUST support subsequent rnd_next() calls for continuation patterns
+  // Basic positioning only - no continuation patterns needed
   
-  if (is_continuation_pattern()) {
-    position_cursor_for_continuation(pos);
-    // Subsequent rnd_next() calls must work from this position
-  } else {
-    position_for_single_row_fetch(pos);
-    // No continuation needed
-  }
-  
-  return fetch_positioned_row(buf);
+  // Simple positioning - used for filesort and multi-table operations
+  position_to_exact_row(pos);
+  return read_positioned_row(buf);  // No continuation needed
 }
 ```
 
-### **Pattern Detection Logic**:
+### **Simplified Pattern Detection**:
 ```cpp
-bool is_continuation_pattern() {
-  return (current_operation == RECURSIVE_CTE_SPILL ||
-          current_operation == WINDOW_FUNCTION_FRAME);
-}
-
+// MAJOR SIMPLIFICATION: No continuation patterns on federated tables!
 bool needs_result_preservation() {
   return (position_calls_made && 
-          (filesort_active || update_active || continuation_pattern_detected()));
+          (filesort_active || update_active || duplicate_handling_active));
+  // NOTE: CTE and Window functions use temp tables - no federated impact
+}
+
+bool is_basic_positioning_only() {
+  return true;  // All federated patterns are basic positioning
 }
 ```
 
@@ -2226,7 +2341,56 @@ bool needs_result_preservation() {
 
 ### **The Complete Truth**:
 - **6 out of 6** `position()` patterns require result set preservation
-- **2 out of 9** `rnd_pos()` patterns require scan continuation  
+- **0 out of 9** `rnd_pos()` patterns require scan continuation on federated tables  
 - **100%** of MySQL installations rely on this behavior
 
 **Your federated engine implementation MUST preserve result sets once `position()` is called. This is not optional - it's fundamental to MySQL storage engine compliance.**
+
+---
+
+## 🎯 **FINAL ANSWER: TRUE FEDERATED ENGINE REQUIREMENTS**
+
+### **🚨 CRITICAL DISCOVERY SUMMARY**
+
+After comprehensive code analysis, **ZERO patterns require `rnd_pos() → rnd_next()` continuation** on federated tables:
+
+1. **Window Functions** ❌ Use temporary frame buffers (MEMORY/InnoDB)
+2. **Recursive CTEs** ❌ Use temporary tables (MEMORY/InnoDB) 
+3. **All other patterns** ❌ Use independent `rnd_pos()` calls only
+
+### **✅ ACTUAL FEDERATED ENGINE REQUIREMENTS**
+
+#### **MANDATORY - Basic Positioning:**
+1. **Filesort Row ID Mode**: `rnd_pos()` for sequential sorted access
+2. **Multi-table UPDATE/DELETE**: `rnd_pos()` for exact row positioning
+3. **INSERT Duplicate Handling**: `rnd_pos()` for conflict resolution
+
+#### **OPTIONAL - Performance:**
+4. **Range Optimization**: `rnd_pos()` for index intersection/union
+5. **Replication Support**: `rnd_pos()` for row-based replication
+
+#### **❌ NOT REQUIRED:**
+- Complex continuation patterns
+- Forward scanning after positioning
+- Result set preservation for continuation
+- Repositioning logic across engine conversions
+
+### **💡 IMPLEMENTATION GUIDANCE**
+
+The existing federated engine implementation **ALREADY SUPPORTS** all required patterns:
+
+```cpp
+// Current federated implementation - sufficient for all MySQL use cases
+int ha_federated::rnd_pos(uchar *buf, uchar *pos) {
+  MYSQL_RES *result;
+  memcpy(&result, pos, sizeof(MYSQL_RES *));        // Get result set
+  memcpy(&result->data_cursor, pos + sizeof(MYSQL_RES *), 
+         sizeof(MYSQL_ROW_OFFSET));                  // Set cursor position
+  return read_next(buf, result);                    // Read positioned row
+}
+```
+
+**The federated TODO comment about "discarding result sets" is now clarified**: 
+- ✅ **Safe to optimize** for most use cases
+- ⚠️ **Must preserve** for filesort and multi-table operations
+- ❌ **No complex continuation** requirements
